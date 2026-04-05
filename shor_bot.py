@@ -12,6 +12,7 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 
 REFRESH_INTERVAL  = 60 * 60
 MAX_HISTORY       = 6
+MAX_PRODUCTS_TO_SEND = 40  # מקסימום מוצרים לשלוח ל-Claude
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -41,12 +42,13 @@ def fetch_products():
             break
         for p in batch:
             cats = " > ".join(c["name"] for c in p.get("categories", []))
-            # שמור רק נתונים חיוניים וקצרים
+            slug = p.get("slug", "")
             all_products.append({
-                "n": p.get("name", "")[:60],
+                "n": p.get("name", "")[:70],
                 "c": cats.split(">")[0].strip()[:30],
                 "p": p.get("price") or p.get("regular_price") or "",
                 "s": 1 if p.get("stock_status") == "instock" else 0,
+                "slug": slug,
             })
         logger.info(f"  עמוד {page}: {len(batch)} מוצרים")
         if len(batch) < 100:
@@ -67,24 +69,65 @@ def refresh_loop():
         except Exception as e:
             logger.error(f"שגיאה ברענון: {e}")
 
-def build_system_prompt():
+def filter_products(query: str) -> list:
+    """סינון חכם — מחזיר רק מוצרים רלוונטיים לשאלה."""
     with products_lock:
-        # המר לפורמט CSV קומפקטי במקום JSON
-        lines = ["שם|קטגוריה|מחיר|במלאי"]
-        for p in products_cache:
-            lines.append(f"{p['n']}|{p['c']}|{p['p']}|{p['s']}")
-        products_text = "\n".join(lines)
+        all_products = list(products_cache)
+
+    # מילות מפתח מהשאלה (ללא מילות עזר)
+    stopwords = {"לי", "תן", "תראה", "רוצה", "מחפש", "יש", "כל", "של", "את", "עד",
+                 "מתחת", "מעל", "בפחות", "ביותר", "שח", "ש\"ח", "שקל", "הכי",
+                 "מה", "איזה", "אני", "גם", "רק", "עם", "בלי", "או", "ו", "מ", "ב", "ל"}
+
+    words = [w for w in re.findall(r'[\u05d0-\u05ea\w]+', query.lower()) if w not in stopwords and len(w) > 1]
+
+    if not words:
+        return all_products[:MAX_PRODUCTS_TO_SEND]
+
+    scored = []
+    for p in all_products:
+        name_lower = p["n"].lower()
+        cat_lower = p["c"].lower()
+        score = 0
+        for w in words:
+            if w in name_lower:
+                score += 3
+            if w in cat_lower:
+                score += 2
+        if score > 0:
+            scored.append((score, p))
+
+    # מיון לפי ציון, החזר עד MAX_PRODUCTS_TO_SEND
+    scored.sort(key=lambda x: -x[0])
+    filtered = [p for _, p in scored[:MAX_PRODUCTS_TO_SEND]]
+
+    # אם אין תוצאות — שלח את כולם (מוגבל)
+    if not filtered:
+        return all_products[:MAX_PRODUCTS_TO_SEND]
+
+    return filtered
+
+def product_url(slug: str) -> str:
+    return f"{WC_URL}/product/{slug}/" if slug else ""
+
+def build_system_prompt(relevant_products: list) -> str:
+    lines = ["שם|קטגוריה|מחיר|מלאי|קישור"]
+    for p in relevant_products:
+        url = product_url(p["slug"])
+        lines.append(f"{p['n']}|{p['c']}|{p['p']}|{p['s']}|{url}")
+    products_text = "\n".join(lines)
 
     return f"""אתה סוכן מוצרים של "שור פתרונות" - חנות ישראלית לקירוי, הצללה, ריהוט גן וציוד שדה.
 
 הנחיות:
-- ענה בעברית בקצרה
+- ענה בעברית בקצרה ובידידותיות
 - הצג עד 8 מוצרים רלוונטיים
 - ציין מחיר אם קיים
-- במלאי: 1=יש, 0=אזל
-- אם אין תוצאות מדויקות - הצע אלטרנטיבות
+- מלאי: 1=יש, 0=אזל
+- אם המשתמש ביקש קישורים — הוסף את הקישור מהעמודה האחרונה
+- אם אין מוצר מתאים — הצע קטגוריות קרובות
 
-מוצרים (שם|קטגוריה|מחיר|במלאי):
+מוצרים רלוונטיים (שם|קטגוריה|מחיר|מלאי|קישור):
 {products_text}"""
 
 async def cmd_start(update: Update, context):
@@ -94,7 +137,11 @@ async def cmd_start(update: Update, context):
     await update.message.reply_text(
         f"שלום! אני הסוכן של שור פתרונות 🏗️\n"
         f"מכיר {count} מוצרים מהאתר.\n\n"
-        "דוגמאות:\n• גזיבו מתחת ל-700 ש\"ח\n• ציוד קמפינג\n• ברזנט ירוק במלאי\n\nשאל! 👇"
+        "דוגמאות:\n"
+        "• גזיבו מתחת ל-700 ש\"ח\n"
+        "• ציוד קמפינג במלאי\n"
+        "• ברזנט ירוק + קישור\n\n"
+        "שאל אותי כל שאלה! 👇"
     )
 
 async def cmd_reset(update: Update, context):
@@ -102,7 +149,7 @@ async def cmd_reset(update: Update, context):
     await update.message.reply_text("✅ השיחה אופסה.")
 
 async def cmd_refresh(update: Update, context):
-    await update.message.reply_text("🔄 מרענן...")
+    await update.message.reply_text("🔄 מרענן מוצרים...")
     try:
         fresh = fetch_products()
         if fresh:
@@ -118,24 +165,33 @@ async def handle_message(update: Update, context):
     text = update.message.text.strip()
     if not text:
         return
+
     logger.info(f"User {user_id}: {text[:80]}")
+
+    # סינון חכם — רק מוצרים רלוונטיים
+    relevant = filter_products(text)
+    logger.info(f"  מוצרים רלוונטיים: {len(relevant)}")
+
     history = user_histories.get(user_id, [])
     history.append({"role": "user", "content": text})
     if len(history) > MAX_HISTORY:
         history = history[-MAX_HISTORY:]
+
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
     try:
         client = Anthropic(api_key=ANTHROPIC_API_KEY)
         response = client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=600,
-            system=build_system_prompt(),
+            system=build_system_prompt(relevant),
             messages=history,
         )
         reply = response.content[0].text
     except Exception as e:
         logger.error(f"Anthropic error: {e}")
         reply = "מצטער, הייתה תקלה. נסה שוב."
+
     history.append({"role": "assistant", "content": reply})
     user_histories[user_id] = history
     await update.message.reply_text(reply)
