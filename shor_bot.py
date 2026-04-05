@@ -23,7 +23,8 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, fil
 
 # ─── הגדרות ───────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"]
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "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")
 WC_URL            = os.environ.get("WC_URL", "https://shorpitronot.co.il")
 WC_KEY            = os.environ["WC_KEY"]
 WC_SECRET         = os.environ["WC_SECRET"]
