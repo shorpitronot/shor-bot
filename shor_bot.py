@@ -11,7 +11,7 @@ WC_SECRET         = os.environ["WC_SECRET"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 
 REFRESH_INTERVAL  = 60 * 60
-MAX_HISTORY       = 10
+MAX_HISTORY       = 6
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -40,20 +40,13 @@ def fetch_products():
         if not batch:
             break
         for p in batch:
-            dims = p.get("dimensions", {})
             cats = " > ".join(c["name"] for c in p.get("categories", []))
-            desc = re.sub(r"<[^>]+>", "", p.get("short_description") or "")[:120]
+            # שמור רק נתונים חיוניים וקצרים
             all_products.append({
-                "id":    p["id"],
-                "name":  p.get("name", "")[:100],
-                "cat":   cats[:80],
-                "desc":  desc,
-                "price": p.get("price") or p.get("regular_price") or "",
-                "sale":  p.get("sale_price") or "",
-                "h":     dims.get("height", ""),
-                "l":     dims.get("length", ""),
-                "w":     dims.get("width", ""),
-                "stock": 1 if p.get("stock_status") == "instock" else 0,
+                "n": p.get("name", "")[:60],
+                "c": cats.split(">")[0].strip()[:30],
+                "p": p.get("price") or p.get("regular_price") or "",
+                "s": 1 if p.get("stock_status") == "instock" else 0,
             })
         logger.info(f"  עמוד {page}: {len(batch)} מוצרים")
         if len(batch) < 100:
@@ -76,20 +69,23 @@ def refresh_loop():
 
 def build_system_prompt():
     with products_lock:
-        products_json = json.dumps(products_cache, ensure_ascii=False)
-    return f"""אתה סוכן מוצרים של חנות "שור פתרונות" - חנות ישראלית המתמחה בפתרונות קירוי, הצללה, ריהוט גן וציוד שדה.
+        # המר לפורמט CSV קומפקטי במקום JSON
+        lines = ["שם|קטגוריה|מחיר|במלאי"]
+        for p in products_cache:
+            lines.append(f"{p['n']}|{p['c']}|{p['p']}|{p['s']}")
+        products_text = "\n".join(lines)
 
-כשמישהו שואל אותך:
-1. חפש במוצרים לפי שם, קטגוריה ותיאור
-2. ענה בעברית בצורה קצרה וידידותית
-3. כשמציג מוצרים - כתוב שם בשורה נפרדת, עם מחיר אם קיים
-4. הגבל ל-8 מוצרים מקסימום
-5. אם אין תוצאות - הצע קטגוריות קרובות
-6. שמור תשובות קצרות (עד 300 מילה)
-7. stock=1 אומר יש במלאי, stock=0 אומר אזל
+    return f"""אתה סוכן מוצרים של "שור פתרונות" - חנות ישראלית לקירוי, הצללה, ריהוט גן וציוד שדה.
 
-רשימת המוצרים:
-{products_json}"""
+הנחיות:
+- ענה בעברית בקצרה
+- הצג עד 8 מוצרים רלוונטיים
+- ציין מחיר אם קיים
+- במלאי: 1=יש, 0=אזל
+- אם אין תוצאות מדויקות - הצע אלטרנטיבות
+
+מוצרים (שם|קטגוריה|מחיר|במלאי):
+{products_text}"""
 
 async def cmd_start(update: Update, context):
     user_histories[update.effective_user.id] = []
@@ -97,8 +93,8 @@ async def cmd_start(update: Update, context):
         count = len(products_cache)
     await update.message.reply_text(
         f"שלום! אני הסוכן של שור פתרונות 🏗️\n"
-        f"אני מכיר {count} מוצרים ומעודכן ישירות מהאתר.\n\n"
-        "לדוגמה:\n• תן לי גזיבואים עד 700 שח\n• מה יש בקמפינג?\n• ברזנט ירוק במלאי\n\nשאל אותי כל שאלה! 👇"
+        f"מכיר {count} מוצרים מהאתר.\n\n"
+        "דוגמאות:\n• גזיבו מתחת ל-700 ש\"ח\n• ציוד קמפינג\n• ברזנט ירוק במלאי\n\nשאל! 👇"
     )
 
 async def cmd_reset(update: Update, context):
@@ -106,14 +102,14 @@ async def cmd_reset(update: Update, context):
     await update.message.reply_text("✅ השיחה אופסה.")
 
 async def cmd_refresh(update: Update, context):
-    await update.message.reply_text("🔄 מרענן מוצרים...")
+    await update.message.reply_text("🔄 מרענן...")
     try:
         fresh = fetch_products()
         if fresh:
             with products_lock:
                 products_cache.clear()
                 products_cache.extend(fresh)
-            await update.message.reply_text(f"✅ עודכן! {len(fresh)} מוצרים.")
+            await update.message.reply_text(f"✅ {len(fresh)} מוצרים עודכנו.")
     except Exception as e:
         await update.message.reply_text(f"❌ שגיאה: {e}")
 
@@ -131,22 +127,21 @@ async def handle_message(update: Update, context):
     try:
         client = Anthropic(api_key=ANTHROPIC_API_KEY)
         response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=800,
+            model="claude-haiku-4-5-20251001",
+            max_tokens=600,
             system=build_system_prompt(),
             messages=history,
         )
         reply = response.content[0].text
     except Exception as e:
         logger.error(f"Anthropic error: {e}")
-        reply = "מצטער, הייתה תקלה. נסה שוב בעוד רגע."
+        reply = "מצטער, הייתה תקלה. נסה שוב."
     history.append({"role": "assistant", "content": reply})
     user_histories[user_id] = history
     await update.message.reply_text(reply)
 
 def main():
     logger.info("מפעיל סוכן מוצרים - שור פתרונות...")
-    logger.info(f"API Key prefix: {ANTHROPIC_API_KEY[:20]}...")
     initial = fetch_products()
     if initial:
         products_cache.extend(initial)
