@@ -40,7 +40,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─── מצב גלובלי ──────────────────────────────────────────────────────────────
-client         = Anthropic(api_key=ANTHROPIC_API_KEY)
+client = Anthropic(api_key=ANTHROPIC_API_KEY)
 products_cache = []
 products_lock  = threading.Lock()
 user_histories : dict[int, list] = {}
