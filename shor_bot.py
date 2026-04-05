@@ -12,7 +12,10 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 
 REFRESH_INTERVAL  = 60 * 60
 MAX_HISTORY       = 6
-MAX_PRODUCTS_TO_SEND = 40  # מקסימום מוצרים לשלוח ל-Claude
+MAX_PRODUCTS_TO_SEND = 40
+
+# ─── משתמשים מורשים בלבד ──────────────────────────────────────────────────────
+ALLOWED_USERS = {377809969, 6306605902}  # הגאי + שחר
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -42,13 +45,12 @@ def fetch_products():
             break
         for p in batch:
             cats = " > ".join(c["name"] for c in p.get("categories", []))
-            slug = p.get("slug", "")
             all_products.append({
                 "n": p.get("name", "")[:70],
                 "c": cats.split(">")[0].strip()[:30],
                 "p": p.get("price") or p.get("regular_price") or "",
                 "s": 1 if p.get("stock_status") == "instock" else 0,
-                "slug": slug,
+                "slug": p.get("slug", ""),
             })
         logger.info(f"  עמוד {page}: {len(batch)} מוצרים")
         if len(batch) < 100:
@@ -70,11 +72,9 @@ def refresh_loop():
             logger.error(f"שגיאה ברענון: {e}")
 
 def filter_products(query: str) -> list:
-    """סינון חכם — מחזיר רק מוצרים רלוונטיים לשאלה."""
     with products_lock:
         all_products = list(products_cache)
 
-    # מילות מפתח מהשאלה (ללא מילות עזר)
     stopwords = {"לי", "תן", "תראה", "רוצה", "מחפש", "יש", "כל", "של", "את", "עד",
                  "מתחת", "מעל", "בפחות", "ביותר", "שח", "ש\"ח", "שקל", "הכי",
                  "מה", "איזה", "אני", "גם", "רק", "עם", "בלי", "או", "ו", "מ", "ב", "ל"}
@@ -97,15 +97,9 @@ def filter_products(query: str) -> list:
         if score > 0:
             scored.append((score, p))
 
-    # מיון לפי ציון, החזר עד MAX_PRODUCTS_TO_SEND
     scored.sort(key=lambda x: -x[0])
     filtered = [p for _, p in scored[:MAX_PRODUCTS_TO_SEND]]
-
-    # אם אין תוצאות — שלח את כולם (מוגבל)
-    if not filtered:
-        return all_products[:MAX_PRODUCTS_TO_SEND]
-
-    return filtered
+    return filtered if filtered else all_products[:MAX_PRODUCTS_TO_SEND]
 
 def product_url(slug: str) -> str:
     return f"{WC_URL}/product/{slug}/" if slug else ""
@@ -113,8 +107,7 @@ def product_url(slug: str) -> str:
 def build_system_prompt(relevant_products: list) -> str:
     lines = ["שם|קטגוריה|מחיר|מלאי|קישור"]
     for p in relevant_products:
-        url = product_url(p["slug"])
-        lines.append(f"{p['n']}|{p['c']}|{p['p']}|{p['s']}|{url}")
+        lines.append(f"{p['n']}|{p['c']}|{p['p']}|{p['s']}|{product_url(p['slug'])}")
     products_text = "\n".join(lines)
 
     return f"""אתה סוכן מוצרים של "שור פתרונות" - חנות ישראלית לקירוי, הצללה, ריהוט גן וציוד שדה.
@@ -127,11 +120,15 @@ def build_system_prompt(relevant_products: list) -> str:
 - אם המשתמש ביקש קישורים — הוסף את הקישור מהעמודה האחרונה
 - אם אין מוצר מתאים — הצע קטגוריות קרובות
 
-מוצרים רלוונטיים (שם|קטגוריה|מחיר|מלאי|קישור):
+מוצרים (שם|קטגוריה|מחיר|מלאי|קישור):
 {products_text}"""
 
 async def cmd_start(update: Update, context):
-    user_histories[update.effective_user.id] = []
+    user_id = update.effective_user.id
+    if user_id not in ALLOWED_USERS:
+        await update.message.reply_text("⛔ אין לך הרשאה להשתמש בבוט זה.")
+        return
+    user_histories[user_id] = []
     with products_lock:
         count = len(products_cache)
     await update.message.reply_text(
@@ -145,10 +142,16 @@ async def cmd_start(update: Update, context):
     )
 
 async def cmd_reset(update: Update, context):
-    user_histories[update.effective_user.id] = []
+    user_id = update.effective_user.id
+    if user_id not in ALLOWED_USERS:
+        return
+    user_histories[user_id] = []
     await update.message.reply_text("✅ השיחה אופסה.")
 
 async def cmd_refresh(update: Update, context):
+    user_id = update.effective_user.id
+    if user_id not in ALLOWED_USERS:
+        return
     await update.message.reply_text("🔄 מרענן מוצרים...")
     try:
         fresh = fetch_products()
@@ -162,13 +165,18 @@ async def cmd_refresh(update: Update, context):
 
 async def handle_message(update: Update, context):
     user_id = update.effective_user.id
+
+    # בדיקת הרשאה
+    if user_id not in ALLOWED_USERS:
+        await update.message.reply_text("⛔ אין לך הרשאה להשתמש בבוט זה.")
+        logger.warning(f"Unauthorized access attempt by user {user_id}")
+        return
+
     text = update.message.text.strip()
     if not text:
         return
 
     logger.info(f"User {user_id}: {text[:80]}")
-
-    # סינון חכם — רק מוצרים רלוונטיים
     relevant = filter_products(text)
     logger.info(f"  מוצרים רלוונטיים: {len(relevant)}")
 
